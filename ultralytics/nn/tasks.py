@@ -77,6 +77,8 @@ from ultralytics.nn.modules import (
     YOLOESegment26,
     v10Detect,
     MyConvBlock,
+    CustomDoubleConv,
+    DoubleConvBackbone,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, WINDOWS, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1720,6 +1722,9 @@ def parse_model(d, ch, verbose=True):
         elif m is CBFuse:
             c2 = ch[f[-1]]
         elif m is DraxNet:
+            c1, c2 = ch[f], args[0]
+            args = [c1, *args]
+        elif m is DoubleConvBackbone:
             c1, c2 = ch[f], args[0]
             args = [c1, *args]
         elif m in frozenset({TorchVision, Index}):
