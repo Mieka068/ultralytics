@@ -2495,3 +2495,150 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise-separable Conv-BN-SiLU used inside the custom DoubleConv-style block."""
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, p: int | None = None):
+        super().__init__()
+        if p is None:
+            p = k // 2
+        self.depthwise = nn.Conv2d(c1, c1, kernel_size=k, stride=s, padding=p, groups=c1, bias=False)
+        self.pointwise = nn.Conv2d(c1, c2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.bn(self.pointwise(self.depthwise(x))))
+
+
+class ChannelAttention(nn.Module):
+    """CBAM-style channel attention branch using average and max pooled descriptors."""
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.shared_mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.sigmoid(self.shared_mlp(self.avg_pool(x)) + self.shared_mlp(self.max_pool(x)))
+        return x * scale
+
+
+class SpatialAttention(nn.Module):
+    """CBAM-style spatial attention branch for emphasizing object regions in aerial imagery."""
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_map = torch.mean(x, dim=1, keepdim=True)
+        max_map, _ = torch.max(x, dim=1, keepdim=True)
+        scale = self.sigmoid(self.conv(torch.cat([avg_map, max_map], dim=1)))
+        return x * scale
+
+
+class CustomDoubleConv(nn.Module):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        stride: int = 1,
+        reduction: int = 16,
+        spatial_kernel: int = 7,
+        shortcut: bool = True,
+    ):
+        super().__init__()
+        self.conv1 = DepthwiseSeparableConv(c1, c2, k=3, s=stride)
+        self.conv2 = DepthwiseSeparableConv(c2, c2, k=3, s=1)
+        self.channel_attn = ChannelAttention(c2, reduction=reduction)
+        self.spatial_attn = SpatialAttention(kernel_size=spatial_kernel)
+
+        self.use_shortcut = bool(shortcut)
+        if self.use_shortcut:
+            if c1 == c2 and stride == 1:
+                self.shortcut = nn.Identity()
+            else:
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(c1, c2, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm2d(c2),
+                )
+        else:
+            self.shortcut = None
+
+        self.out_act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv2(self.conv1(x))
+        y = self.channel_attn(y)
+        y = self.spatial_attn(y)
+        if self.shortcut is not None:
+            y = y + self.shortcut(x)
+        return self.out_act(y)
+
+
+class DoubleConvBackbone(nn.Module):
+    def __init__(self, c1: int, c2: int = 1024, out_channels=(256, 512, 1024)):
+        super().__init__()
+        if len(out_channels) != 3:
+            raise ValueError(f"DoubleConvBackbone expects exactly three output channels, got {out_channels}")
+
+        # Parser-facing output width used by the custom parse_model branch.
+        self.c2 = c2
+
+        # Stem: 640 -> 320, then stages produce P2/4, P3/8, P4/16, and P5/32.
+        self.stem = nn.Sequential(
+            nn.Conv2d(c1, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
+        )
+
+        self.stage1 = nn.Sequential(
+            CustomDoubleConv(64, 128, stride=2),
+            CustomDoubleConv(128, 128, stride=1),
+        )
+        self.stage2 = nn.Sequential(
+            CustomDoubleConv(128, 256, stride=2),
+            CustomDoubleConv(256, 256, stride=1),
+        )
+        self.stage3 = nn.Sequential(
+            CustomDoubleConv(256, 512, stride=2),
+            CustomDoubleConv(512, 512, stride=1),
+        )
+        self.stage4 = nn.Sequential(
+            CustomDoubleConv(512, 1024, stride=2),
+            CustomDoubleConv(1024, 1024, stride=1),
+        )
+
+        self.p3_proj = nn.Conv2d(256, out_channels[0], kernel_size=1, bias=False)
+        self.p4_proj = nn.Conv2d(512, out_channels[1], kernel_size=1, bias=False)
+        self.p5_proj = nn.Conv2d(1024, out_channels[2], kernel_size=1, bias=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor):
+        x = self.stem(x)       # P1/2
+        x = self.stage1(x)     # P2/4
+        p3 = self.stage2(x)    # P3/8
+        p4 = self.stage3(p3)   # P4/16
+        p5 = self.stage4(p4)   # P5/32
+        return [self.p3_proj(p3), self.p4_proj(p4), self.p5_proj(p5)]
+
