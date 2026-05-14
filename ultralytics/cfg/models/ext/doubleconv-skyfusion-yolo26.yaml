@@ -1,7 +1,4 @@
-# Ultralytics YOLO26 object detection model for SkyFusion
-# Rubric-aligned refactor of the earlier PhoenixNet idea:
-# CustomDoubleConv = two-conv DoubleConv-style block + depthwise separable convs + CBAM attention + residual shortcut.
-# DoubleConvBackbone returns [P3, P4, P5], and Index layers select each feature map for the YOLO26 head.
+
 
 nc: 3 # SkyFusion classes: Aircraft, ship, vehicle
 end2end: True
